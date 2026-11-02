@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime, time, timezone
+from datetime import datetime, time
 import streamlit.components.v1 as components
 
 from resampler import (
@@ -10,7 +10,7 @@ from resampler import (
     resample_and_align_to_calendar,
 )
 from data_loader import (
-    fetch_ccxt_window,
+    fetch_crypto_with_fallback,
     fetch_yfinance_window,
     parse_tradingview_csv,
 )
@@ -22,7 +22,6 @@ st.set_page_config(
     layout="wide",
 )
 
-# Custom CSS für TradingView-Feeling und saubere Druckansicht (@media print)
 st.markdown(
     """
     <style>
@@ -44,11 +43,12 @@ st.title("📈 Multi-Asset Chart-Abschnitts-Vergleich (Kalender-Synchronisiert)"
 with st.sidebar:
     st.header("1. Datenquelle & Asset")
     source_type = st.selectbox(
-        "Datenquelle wählen",
+        "Primäre Datenquelle wählen (mit Auto-Fallback)",
         [
-            "Krypto (Binance via CCXT)",
-            "Krypto (Kraken via CCXT)",
-            "Krypto (Coinbase via CCXT)",
+            "Krypto Auto-Fallback (Start: Binance)",
+            "Krypto Auto-Fallback (Start: Coinbase)",
+            "Krypto Auto-Fallback (Start: Kraken)",
+            "Krypto Auto-Fallback (Start: Bitstamp)",
             "Aktien / Rohstoffe / Forex (yfinance)",
             "TradingView CSV-Import",
         ],
@@ -59,12 +59,15 @@ with st.sidebar:
         uploaded_csv = st.file_uploader(
             "TradingView CSV-Datei hochladen",
             type=["csv"],
-            help="Exportiere in TradingView über 'Chart-Daten exportieren...' als CSV (UNIX-Zeit oder ISO-Format).",
+            help="Exportiere in TradingView über 'Chart-Daten exportieren...' als CSV.",
         )
         symbol = uploaded_csv.name.replace(".csv", "") if uploaded_csv else "CSV_ASSET"
-    elif "CCXT" in source_type:
-        default_sym = "BTC/USDT" if "Binance" in source_type else "BTC/USD"
-        symbol = st.text_input("Handelspaar (z. B. BTC/USDT, ETH/USD, SOL/USDT)", value=default_sym)
+    elif "Krypto" in source_type:
+        symbol = st.text_input(
+            "Handelspaar (z. B. BTC/USDT, BTC/USD, ETH/USD)",
+            value="BTC/USDT",
+            help="Falls eine Börse USDT nicht unterstützt, konvertiert der Fallback automatisch auf USD/USDC.",
+        )
     else:
         symbol = st.text_input(
             "Ticker-Symbol (Yahoo Finance)",
@@ -99,7 +102,7 @@ with st.sidebar:
         max_value=200000,
         value=1335,
         step=10,
-        help="Beispiel: 1335 auf dem 1D-Chart = exakt 1335 Kalendertage vor dem Startdatum (auch bis 33.000+ möglich).",
+        help="Beispiel: 1335 auf dem 1D-Chart = exakt 1335 Kalendertage vor dem Startdatum.",
     )
 
     visible_candles = st.number_input(
@@ -130,7 +133,6 @@ grid_lower = generate_calendar_timestamps(start_lower_dt, int(visible_candles), 
 end_upper_dt = grid_upper[-1]
 end_lower_dt = grid_lower[-1]
 
-# Parse vertikale Vergleichslinien
 sync_indices = []
 if sync_lines_str.strip():
     for part in sync_lines_str.split(","):
@@ -138,10 +140,11 @@ if sync_lines_str.strip():
         if part.isdigit():
             sync_indices.append(int(part))
 
-# --- DATEN LADEN ---
+# --- DATEN LADEN (INKL. AUTO-FALLBACK) ---
 base_tf = TIMEFRAME_CONFIG[timeframe]["base"]
 raw_upper, raw_lower = pd.DataFrame(), pd.DataFrame()
-warning_banner = ""
+used_source_upper, used_source_lower = "", ""
+fallback_notes = []
 
 with st.spinner(f"Lade und synchronisiere Kalenderdaten für {symbol} ({timeframe})..."):
     if source_type == "TradingView CSV-Import":
@@ -149,31 +152,40 @@ with st.spinner(f"Lade und synchronisiere Kalenderdaten für {symbol} ({timefram
             full_csv_df = parse_tradingview_csv(uploaded_csv)
             raw_upper = full_csv_df
             raw_lower = full_csv_df
+            used_source_upper = used_source_lower = "TradingView CSV"
         else:
             st.info("Bitte lade links in der Sidebar eine exportierte TradingView-CSV-Datei hoch.")
             st.stop()
 
-    elif "CCXT" in source_type:
+    elif "Krypto" in source_type:
         exchange_map = {
-            "Krypto (Binance via CCXT)": "binance",
-            "Krypto (Kraken via CCXT)": "kraken",
-            "Krypto (Coinbase via CCXT)": "coinbase",
+            "Krypto Auto-Fallback (Start: Binance)": "binance",
+            "Krypto Auto-Fallback (Start: Coinbase)": "coinbase",
+            "Krypto Auto-Fallback (Start: Kraken)": "kraken",
+            "Krypto Auto-Fallback (Start: Bitstamp)": "bitstamp",
         }
-        ex_id = exchange_map[source_type]
-        try:
-            raw_upper = fetch_ccxt_window(ex_id, symbol, base_tf, start_upper_dt, end_upper_dt)
-            raw_lower = fetch_ccxt_window(ex_id, symbol, base_tf, start_lower_dt, end_lower_dt)
-        except Exception as e:
-            st.error(f"Fehler beim Abruf von {ex_id}: {e}")
-            st.stop()
+        pref_ex = exchange_map[source_type]
+
+        raw_upper, used_source_upper, logs_up = fetch_crypto_with_fallback(
+            pref_ex, symbol, base_tf, start_upper_dt, end_upper_dt
+        )
+        raw_lower, used_source_lower, logs_low = fetch_crypto_with_fallback(
+            pref_ex, symbol, base_tf, start_lower_dt, end_lower_dt
+        )
+        fallback_notes = list(dict.fromkeys(logs_up + logs_low))
 
     else:
         raw_upper, warn1 = fetch_yfinance_window(symbol, base_tf, start_upper_dt, end_upper_dt)
         raw_lower, warn2 = fetch_yfinance_window(symbol, base_tf, start_lower_dt, end_lower_dt)
-        warning_banner = warn2 or warn1
+        used_source_upper = used_source_lower = f"Yahoo Finance ({symbol})"
+        if warn1 or warn2:
+            fallback_notes.append(warn2 or warn1)
 
-if warning_banner:
-    st.warning(warning_banner)
+# Falls Fallback ausgelöst wurde (z. B. Binance 451 -> Wechsel auf Coinbase), dezent als Expander anzeigen
+if fallback_notes:
+    with st.expander(f"ℹ️ Automatischer Quellen-Wechsel aktiv (Geladen von: Oben = {used_source_upper} | Unten = {used_source_lower})", expanded=False):
+        for note in fallback_notes:
+            st.caption(f"• {note}")
 
 # --- RESAMPLING AUF KALENDER-RASTER ---
 df_upper = resample_and_align_to_calendar(
@@ -185,8 +197,8 @@ df_lower = resample_and_align_to_calendar(
 
 # --- INFO-METRIKEN ---
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("Oberer Startpunkt", start_upper_dt.strftime("%Y-%m-%d %H:%M UTC"))
-m2.metric(f"Unterer Startpunkt (-{offset_candles:,})", start_lower_dt.strftime("%Y-%m-%d %H:%M UTC"))
+m1.metric("Oberer Startpunkt", start_upper_dt.strftime("%Y-%m-%d %H:%M UTC"), delta=used_source_upper, delta_color="off")
+m2.metric(f"Unterer Startpunkt (-{offset_candles:,})", start_lower_dt.strftime("%Y-%m-%d %H:%M UTC"), delta=used_source_lower, delta_color="off")
 m3.metric("Kalender-Differenz", f"{(start_upper_dt - start_lower_dt).days:,} Tage")
 valid_up = int(df_upper["open"].notna().sum())
 valid_low = int(df_lower["open"].notna().sum())
@@ -196,7 +208,7 @@ m4.metric("Gehandelte Kerzen (Oben / Unten)", f"{valid_up} / {valid_low} von {vi
 fig = create_comparison_chart(
     df_upper=df_upper,
     df_lower=df_lower,
-    symbol_label=symbol,
+    symbol_label=f"{symbol} [{used_source_upper}]",
     tf=timeframe,
     start_upper=start_upper_dt,
     start_lower=start_lower_dt,
@@ -205,7 +217,6 @@ fig = create_comparison_chart(
     chart_height=chart_height,
 )
 
-# Plotly Modebar mit interaktiven Zeichenwerkzeugen (Linien, Rechtecke, Radierer)
 plotly_config = {
     "scrollZoom": True,
     "displaylogo": False,
@@ -239,7 +250,6 @@ st.subheader("💾 Analyse speichern, exportieren oder drucken")
 
 exp_col1, exp_col2, exp_col3, exp_col4 = st.columns(4)
 
-# 1. Interaktiver HTML-Export (inkl. gezogener Linien & Zoom)
 html_bytes = fig.to_html(include_plotlyjs="cdn", config=plotly_config).encode("utf-8")
 with exp_col1:
     st.download_button(
@@ -249,7 +259,6 @@ with exp_col1:
         mime="text/html",
     )
 
-# 2. Hochauflösender PNG/PDF Bild-Export via Kaleido
 with exp_col2:
     try:
         png_bytes = fig.to_image(format="png", width=1600, height=chart_height, scale=2)
@@ -262,7 +271,6 @@ with exp_col2:
     except Exception:
         st.info("Für direkten PNG-Download `kaleido` installieren oder Kamera-Icon oben rechts im Chart nutzen.")
 
-# 3. Kombinierter CSV-Datenexport
 merged_export = pd.DataFrame({
     "candle_index": df_upper["candle_index"],
     "upper_timestamp": df_upper["timestamp"],
@@ -284,7 +292,6 @@ with exp_col3:
         mime="text/csv",
     )
 
-# 4. Direktes Drucken über Browser-Dialog
 with exp_col4:
     if st.button("🖨️ Analyse-Ansicht drucken"):
         components.html("<script>window.parent.print();</script>", height=0, width=0)
